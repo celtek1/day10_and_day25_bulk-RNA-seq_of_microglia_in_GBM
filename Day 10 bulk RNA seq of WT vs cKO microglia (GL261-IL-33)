@@ -1,0 +1,128 @@
+library(DESeq2)
+library(clusterProfiler)
+library(msigdbr)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+set.seed(1)
+dir.create("results", showWarnings = FALSE)
+
+# datafile loading
+countdata_cKO <- read.delim("countdata_cKO.txt", row.names = 1)
+countdata_old <- read.delim("countdata_old.txt", row.names = 1)
+all(rownames(countdata_old) == rownames(countdata_cKO))
+countdata <- cbind(countdata_old, countdata_cKO)
+countdata <- as.matrix(countdata)
+mode(countdata) <- "integer"
+# coldata
+sample_names <- colnames(countdata)
+coldata <- data.frame(sample = sample_names, group = c("IL33", "IL33","IL33_cKO", "IL33_cKO"),
+                      genotype = c("WT", "WT","cKO", "cKO"),
+                      batch = c("old", "old", "new", "new"),
+                      row.names = sample_names,  stringsAsFactors = FALSE)
+coldata$group <- factor(coldata$group,levels = c("IL33", "IL33_cKO"))
+coldata$genotype <- factor(coldata$genotype, levels = c("WT", "cKO"))
+coldata$batch <- factor(coldata$batch)
+coldata
+all(colnames(countdata) == rownames(coldata))
+
+# processing
+all(rownames(coldata) %in% colnames(countdata))
+countdata <- countdata[, rownames(coldata)]
+all(rownames(coldata) == colnames(countdata))
+anyNA(countdata)
+which(is.na(countdata), arr.ind = TRUE)
+countdata[is.na(countdata)] <- 0
+
+# DEseq2 
+dds <- DESeqDataSetFromMatrix(countData = countdata,
+                              colData   = coldata,
+                              design    = ~ group)
+dds <- DESeq(dds)
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep,]
+dds <- DESeq(dds)
+saveRDS(dds, file = "dds.rds")
+res <- results(dds, contrast = c("group", "WT", "cKO"))
+res_df <- as.data.frame(res) %>% rownames_to_column("gene") %>% arrange(padj)
+write.csv(as.data.frame(res) %>% tibble::rownames_to_column("gene"),"results/res_WTvscKO.csv", row.names = FALSE)
+vsd <- vst(dds, blind = FALSE)
+
+# GSEA on GO:BP, ranked by Wald statistic
+gene_list <- res$stat
+names(gene_list) <- rownames(res)
+gene_list <- sort(na.omit(gene_list), decreasing = TRUE)
+T2G <- msigdbr(species = "Mus musculus", collection = "C5", subcollection = "GO:BP") %>%
+  dplyr::select(gs_name, gene_symbol)
+gsea_GOBP <- GSEA(geneList = gene_list,
+                  TERM2GENE = T2G,
+                  minGSSize = 10, maxGSSize = 5000,
+                  pAdjustMethod = "BH", pvalueCutoff = 1,
+                  nPerm = 100000,
+                  seed = TRUE, verbose = FALSE)
+gsea_res <- as.data.frame(gsea_GOBP@result)
+write.csv(gsea_res, "results/GOBP_WTvscKO_results.csv", row.names = FALSE)
+
+
+# top immune-related GOBP terms enriched in WT
+gse_GOBP_up_sig <- gsea_res %>% dplyr::filter(NES > 0, pvalue < 0.05, p.adjust < 0.05)
+immune_idx <- grepl(
+  "IMMUNE|IMMUNITY|LEUKOCYTE|LYMPHOCYTE|_T_CELL|_B_CELL|NEUTROPHIL|GRANULOCYTE|ANTIGEN|PHAGOCYTOSIS|CYTOKINE_|HYPERSENSITIVITY|COMPLEMENT",
+  gse_GOBP_up_sig$ID
+)
+gse_GOBP_up_immune_sig <- gse_GOBP_up_sig[immune_idx, ]
+
+# GOBP graph
+library(dplyr)
+top_n <- 5
+gse_bar <- gse_GOBP_up_immune_sig %>% arrange(desc(NES)) %>% slice(1:top_n)
+library(ggplot2)
+gse_bar$ID <- factor(gse_bar$ID, levels = rev(gse_bar$ID))
+ggplot(gse_bar, aes(x = ID, y = NES, fill = p.adjust)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "red", high = "blue", name = "p.adjust") +
+  labs(
+    x = NULL,
+    y = "NES",
+    title = "Top immune-related GOBP (NES, colored by p.adjust)"
+  ) +
+  theme_bw(base_size = 12)
+
+# Heatmap
+term_id <- "GOBP_ANTIGEN_PROCESSING_AND_PRESENTATION"
+core_genes <- strsplit(gsea_res$core_enrichment[gsea_res$ID == term_id], "/")[[1]]
+core_genes <- intersect(core_genes, rownames(vsd))
+
+mat <- assay(vsd)[core_genes, , drop = FALSE]
+mat_z <- t(scale(t(mat)))
+mat_z <- mat_z[complete.cases(mat_z), , drop = FALSE]
+
+sample_order <- rownames(coldata)[order(coldata$condition, rownames(coldata))]
+heat_df <- data.frame(
+  gene   = rep(rownames(mat_z), times = length(sample_order)),
+  sample = rep(sample_order, each = nrow(mat_z)),
+  z      = as.vector(mat_z[, sample_order])
+) %>%
+  mutate(gene  = factor(gene, levels = rownames(mat_z)),
+         sample = factor(sample, levels = rev(sample_order)),
+         group  = factor(ifelse(coldata[as.character(sample), "condition"] == "ctrl",
+                                "GL261-Ctrl", "GL261-IL-33"),
+                         levels = c("GL261-Ctrl", "GL261-IL-33")))
+
+p_heat <- ggplot(heat_df, aes(x = gene, y = sample, fill = z)) +
+  geom_tile() +
+  facet_grid(group ~ ., scales = "free_y", space = "free_y", switch = "y") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, name = "z-score") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 16) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        axis.text.y = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),
+        panel.spacing = unit(0, "pt"),
+        strip.placement = "outside",
+        strip.text.y.left = element_text(angle = 0))
+ggsave("results/antigen_presentation_heatmap.png", p_heat, width = 9.75, height = 3.7, dpi = 100)
