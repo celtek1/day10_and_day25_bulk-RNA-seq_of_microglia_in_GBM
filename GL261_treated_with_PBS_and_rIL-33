@@ -1,0 +1,104 @@
+# datafile loading
+countdata <- read.delim("gene_count.txt", row.names = 1)
+coldata <- read.delim("coldata.txt", row.names = 1)
+
+# package loading
+library(DESeq2)
+library(tidyverse)
+library(pheatmap)
+library(ggplot2)
+library(ggrepel)
+library(clusterProfiler)
+library(enrichplot)
+library(msigdbr)
+library(rtracklayer)
+library(dplyr)
+library(tibble)
+library(apeglm)
+library(stringr)
+
+# processing
+all(rownames(coldata) %in% colnames(countdata))
+countdata <- countdata[, rownames(coldata)]
+all(rownames(coldata) == colnames(countdata))
+anyNA(countdata)
+which(is.na(countdata), arr.ind = TRUE)
+countdata[is.na(countdata)] <- 0
+coldata$condition <- as.factor(coldata$condition)
+
+# DEseq2 
+dds <- DESeqDataSetFromMatrix(countData = countdata,
+                              colData   = coldata,
+                              design    = ~ condition)
+dds <- DESeq(dds)
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+dds <- DESeq(dds)
+saveRDS(dds, file = "dds.rds")
+res <- results(dds)
+res
+res <- results(dds, contrast = c("condition","IL33","Mock"))
+res
+saveRDS(res, file = "res.rds")
+write.csv(as.data.frame(res), file = "res_results.csv")
+
+# data loading
+dds <- readRDS("dds.rds")
+
+# DEG extraction
+padj_cut <- 0.05
+log2FoldChange  <- 1
+deg <- subset(res, is.finite(padj) & padj < 0.05 & abs(log2FoldChange) >= 1)
+deg_up   <- subset(deg, log2FoldChange >=  1)
+deg_down   <- subset(deg, log2FoldChange <=  -1)
+write.csv(as.data.frame(deg_up), file = "DEG_up.csv")
+write.csv(as.data.frame(deg_down), file = "DEG_down.csv")
+
+vsd <- vst(dds, blind = F)
+saveRDS(vsd, file = "vsd.rds")
+colData(vsd)$condition <- factor(trimws(as.character(colData(dds)$condition)),levels = c("Mock","IL33"))
+rld <- rlog(dds, blind = F)
+saveRDS(rld, file = "rld.rds")
+head(assay(vsd), 3)
+
+# volcano
+p_cut <- 0.05
+fc_cut <- 1
+keyvals <- rep("grey70", nrow(res))
+keyvals[!is.na(res$pvalue) &
+          res$pvalue < p_cut &
+          res$log2FoldChange >= fc_cut] <- "red"
+keyvals[!is.na(res$pvalue) &
+          res$pvalue < p_cut &
+          res$log2FoldChange <= -fc_cut] <- "blue"
+names(keyvals) <- rep("NS", nrow(res))
+names(keyvals)[keyvals == "red"] <- "Up in IL33"
+names(keyvals)[keyvals == "blue"] <- "Down in IL33"
+
+EnhancedVolcano(
+  res,
+  lab = rownames(res),
+  x = "log2FoldChange",
+  y = "pvalue",
+  title = "ctrl versus IL33",
+  pCutoff = p_cut,
+  FCcutoff = fc_cut,
+  pointSize = 1.0,
+  labSize = 5.0,
+  shape = 16,
+  colAlpha = 1,
+  gridlines.major = FALSE,
+  gridlines.minor = FALSE,
+  colCustom = keyvals,
+  drawConnectors = TRUE,
+  arrowheads = TRUE,
+  widthConnectors = 0.6,
+  colConnectors = "black",
+  typeConnectors = "closed",
+  endsConnectors = "last",
+  lengthConnectors = unit(0.015, "npc"),
+  
+  boxedLabels = FALSE,
+  max.overlaps = Inf,
+)
