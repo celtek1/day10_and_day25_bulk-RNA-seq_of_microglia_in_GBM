@@ -19,7 +19,6 @@ mode(countdata) <- "integer"
 sample_names <- colnames(countdata)
 coldata <- data.frame(sample = sample_names, group = c("IL33", "IL33","IL33_cKO", "IL33_cKO"),
                       genotype = c("WT", "WT","cKO", "cKO"),
-                      batch = c("old", "old", "new", "new"),
                       row.names = sample_names,  stringsAsFactors = FALSE)
 coldata$group <- factor(coldata$group,levels = c("IL33", "IL33_cKO"))
 coldata$genotype <- factor(coldata$genotype, levels = c("WT", "cKO"))
