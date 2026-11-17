@@ -1,0 +1,278 @@
+# datafile loading
+countdata <- read.delim("gene_count.txt", row.names = 1)
+coldata <- read.delim("coldata.txt", row.names = 1)
+
+library(DESeq2)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(stringr)
+library(clusterProfiler)
+library(msigdbr)
+library(EnhancedVolcano)
+library(pheatmap)
+
+# processing
+all(rownames(coldata) %in% colnames(countdata))
+countdata <- countdata[, rownames(coldata)]
+all(rownames(coldata) == colnames(countdata))
+anyNA(countdata)
+which(is.na(countdata), arr.ind = TRUE)
+countdata[is.na(countdata)] <- 0
+coldata$condition <- as.factor(coldata$condition)
+
+# DEseq2 
+dds <- DESeqDataSetFromMatrix(countData = countdata,
+                              colData   = coldata,
+                              design    = ~ condition)
+dds <- DESeq(dds)
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+dds <- DESeq(dds)
+saveRDS(dds, file = "dds.rds")
+res <- results(dds)
+res
+res <- results(dds, contrast = c("condition","IL33","ctrl"))
+res
+saveRDS(res, file = "res.rds")
+write.csv(as.data.frame(res), file = "res_results.csv")
+
+# data loading
+dds <- readRDS("dds.rds")
+
+# DEG extraction
+padj_cut <- 0.05
+log2FoldChange  <- 1
+deg <- subset(res, is.finite(padj) & padj < 0.05 & abs(log2FoldChange) >= 1)
+deg_up   <- subset(deg, log2FoldChange >=  1)
+deg_down   <- subset(deg, log2FoldChange <=  -1)
+write.csv(as.data.frame(deg_up), file = "DEG_up.csv")
+write.csv(as.data.frame(deg_down), file = "DEG_down.csv")
+# DEG LFC shrink
+coef_name <- grep("condition_IL33_vs_ctrl", resultsNames(dds), value = TRUE)
+res_lfc <- lfcShrink(dds, coef = coef_name, type = "apeglm")
+res_lfc_df <- as.data.frame(res_lfc) %>%  rownames_to_column("gene") %>%  filter(!is.na(padj))
+res_use <- if (exists("res_lfc")) as.data.frame(res_lfc) else as.data.frame(res)
+res_use <- res_use %>% rownames_to_column("gene") %>% filter(!is.na(padj))
+sig <- res_use %>% filter(padj < 0.05, abs(log2FoldChange) >= 1)
+deg_up <- res_use %>% filter(padj < 0.05, log2FoldChange > 1) %>% arrange(desc(log2FoldChange))
+deg_down <- res_use %>% filter(padj < 0.05, log2FoldChange < -1) %>% arrange(     log2FoldChange)
+deg_genes <- c(deg_up$gene, deg_down$gene)
+deg_genes
+
+vsd <- vst(dds, blind = F)
+saveRDS(vsd, file = "vsd.rds")
+colData(vsd)$condition <- factor(trimws(as.character(colData(dds)$condition)),levels = c("ctrl","IL33"))
+rld <- rlog(dds, blind = F)
+saveRDS(rld, file = "rld.rds")
+head(assay(vsd), 3)
+
+#enhancedvolcano
+BiocManager::install('EnhancedVolcano')
+library(EnhancedVolcano)
+p_cut <- 0.05
+fc_cut <- 1
+keyvals <- rep("grey70", nrow(res))
+keyvals[!is.na(res$padj) &
+          res$padj < p_cut &
+          res$log2FoldChange >= fc_cut] <- "red"
+keyvals[!is.na(res$padj) &
+          res$padj < p_cut &
+          res$log2FoldChange <= -fc_cut] <- "blue"
+names(keyvals) <- rep("NS", nrow(res))
+names(keyvals)[keyvals == "red"] <- "Up in IL33"
+names(keyvals)[keyvals == "blue"] <- "Down in IL33"
+
+EnhancedVolcano(
+  res,
+  lab = rownames(res),
+  x = "log2FoldChange",
+  y = "padj",
+  title = "ctrl versus IL33",
+  pCutoff = p_cut,
+  FCcutoff = fc_cut,
+  pointSize = 1.0,
+  labSize = 5.0,
+  shape = 16,
+  colAlpha = 1,
+  gridlines.major = FALSE,
+  gridlines.minor = FALSE,
+  colCustom = keyvals,
+  selectLab = c("Ciita", "H2-Eb1", "Cd40"),
+  drawConnectors = TRUE,
+  arrowheads = TRUE,
+  widthConnectors = 0.6,
+  colConnectors = "black",
+  typeConnectors = "closed",
+  endsConnectors = "last",
+  lengthConnectors = unit(0.015, "npc"),
+  boxedLabels = FALSE,
+  max.overlaps = Inf,
+)
+
+# GSEA
+library(msigdbr)
+gene_list <- res$stat
+names(gene_list) <- rownames(res)
+gene_list <- sort(na.omit(gene_list), decreasing = TRUE)
+gene_list
+
+T2G <- msigdbr(species = "Mus musculus", collection = "C5", subcollection = "GO:BP") %>%
+  distinct(gs_name, gene_symbol)
+
+set.seed(1234)
+
+gse_GOBP <- GSEA(geneList = gene_list, TERM2GENE = T2G,
+                 minGSSize = 10, maxGSSize = 5000,
+                 pAdjustMethod = "BH", pvalueCutoff = 1,
+                 nPermSimple = 100000, seed = TRUE, verbose = FALSE)
+saveRDS(gse_GOBP, file = "gse_GOBP.rds")
+
+gse_GOBP_results <- as.data.frame(gse_GOBP@result)
+write.csv(gse_GOBP_results, file = "gse_GOBP_results.csv", row.names = FALSE)
+
+exclude_terms <- c(
+  "GOBP_CELLULAR_RESPONSE_TO_TYPE_II_INTERFERON",     # overlaps RESPONSE_TO_TYPE_II_INTERFERON
+  "GOBP_REGULATION_OF_ALPHA_BETA_T_CELL_ACTIVATION"   # overlaps ALPHA_BETA_T_CELL_ACTIVATION
+)
+
+gse_bar <- gse_GOBP_results %>%
+  filter(NES > 0, pvalue < 0.05, p.adjust < 0.05, !ID %in% exclude_terms) %>%
+  arrange(desc(NES)) %>%
+  slice(1:5)
+gse_bar$label <- gse_bar$ID %>%
+  str_remove("^GOBP_") %>% str_replace_all("_", " ") %>% str_to_sentence()
+gse_bar$label <- factor(gse_bar$label, levels = rev(gse_bar$label))
+
+p_bar <- ggplot(gse_bar, aes(x = NES, y = label, fill = p.adjust)) +
+  geom_col() +
+  scale_fill_gradient(low = "red", high = "blue", name = "p.adjust") +
+  labs(x = "NES", y = NULL,
+       title = "Enriched in microglia from GL261-IL-33 tumors") +
+  theme_classic(base_size = 12)
+ggsave("GOBP_NES_barplot.pdf", p_bar, width = 6, height = 3)
+
+# heatmap
+library(pheatmap)
+term_id <- "GOBP_RESPONSE_TO_TYPE_II_INTERFERON"
+row_term   <- gse_GOBP@result[gse_GOBP@result$ID == term_id, ]
+core_genes <- unlist(strsplit(row_term$core_enrichment, "/"))
+core_use   <- intersect(core_genes, rownames(vsd))
+cat("GSEA leading edge:", length(core_genes), length(core_use), "\n")
+
+lfc <- res_use$log2FoldChange[match(core_use, res_use$gene)]
+ord <- order(lfc, decreasing = TRUE)
+core_use <- core_use[ord]
+
+topN <- 30
+if (length(core_use) > topN) core_use <- head(core_use, topN)
+
+canon <- c("Stat1","Irf1","Gbp2","Gbp3","Gbp5","Cxcl9","Cxcl10",
+           "Ciita","Cd74","H2-Ab1","H2-Aa","H2-Eb1","Psmb8","Psmb9","Tap1")
+cat("canonical target:\n"); print(intersect(canon, core_genes))
+
+ord_col <- order(coldata$condition)
+library(DESeq2)
+mat <- assay(vsd)[core_use, ord_col, drop = FALSE]
+ann_col <- data.frame(Group = coldata$condition[ord_col],
+                      row.names = colnames(vsd)[ord_col])
+
+pheatmap(
+  t(scale(t(mat))),
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  annotation_col = ann_col,
+  annotation_colors = list(condition = c(Ctrl = "grey60", IL33 = "red")),
+  gaps_col = sum(coldata$group == "Ctrl"),
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  fontsize_row = 8,
+  color = colorRampPalette(c("blue", "white", "red"))(255),
+  border_color = NA,
+  main = "Response to type II interferon (leading edge)"
+)
+
+mat_z <- t(scale(t(mat)))        
+
+ann_row <- data.frame(Group = coldata$condition[ord_col],
+                      row.names = colnames(vsd)[ord_col])
+
+pheatmap(
+  t(mat_z),                       
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  annotation_row = ann_row,        # annotation_col → annotation_row
+  annotation_colors = list(Group = c(ctrl = "cyan", IL33 = "salmon")),
+  gaps_row = sum(coldata$group == "ctrl"),   # gaps_col → gaps_row
+  show_rownames = FALSE,          
+  show_colnames = TRUE,          
+  fontsize_col = 8,
+  angle_col = 90,                  
+  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(255),
+  border_color = NA
+)
+
+# heatmap transpose
+mat_core_scaled <- t(scale(t(mat_core)))
+# transpose: rows = samples, columns = genes
+mat_core_scaled_t <- t(mat_core_scaled)
+pheatmap(
+  mat_core_scaled_t,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,   # sample names
+  show_colnames = TRUE,   # gene names
+  fontsize_row = 10,
+  fontsize_col = 8,
+  angle_col = "90",
+  main = term_id,
+  color = heat_cols
+)
+
+# GSEA enrichplot
+gseaplot2(
+  gse_GOBP,
+  geneSetID = "GOBP_PHAGOCYTOSIS",
+  title = "GOBP_PHAGOCYTOSIS",
+  base_size = 14)
+
+# heatmap
+term_id <- "GOBP_PHAGOCYTOSIS"   
+row_term <- gse_GOBP@result[gse_GOBP@result$ID == term_id, ]
+core_genes <- unlist(strsplit(row_term$core_enrichment, "/"))
+core_genes
+core_genes_use <- intersect(core_genes, rownames(vsd))
+length(core_genes)      
+length(core_genes_use)  
+mat_core <- assay(vsd)[core_genes_use, , drop = FALSE]
+library(pheatmap)
+mat_core_scaled <- t(scale(t(mat_core)))
+rownames(ann_col) <- colnames(vsd)
+heat_cols <- colorRampPalette(c("blue","white","red"))(255)
+pheatmap(
+  mat_core_scaled,
+  cluster_rows = F,
+  cluster_cols = F,
+  show_rownames = TRUE,
+  fontsize_row = 10,
+  main = term_id,
+  color = heat_cols
+)
+
+# heatmap transpose
+mat_core_scaled <- t(scale(t(mat_core)))
+# transpose: rows = samples, columns = genes
+mat_core_scaled_t <- t(mat_core_scaled)
+pheatmap(
+  mat_core_scaled_t,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,   # sample names
+  show_colnames = TRUE,   # gene names
+  fontsize_row = 10,
+  fontsize_col = 8,
+  angle_col = "90",
+  main = term_id,
+  color = heat_cols
+)
